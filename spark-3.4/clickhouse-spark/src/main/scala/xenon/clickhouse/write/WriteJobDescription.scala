@@ -15,11 +15,11 @@
 package xenon.clickhouse.write
 
 import java.time.ZoneId
-
 import org.apache.spark.sql.clickhouse.{ExprUtils, WriteOptions}
 import org.apache.spark.sql.connector.expressions.{Expression, SortOrder, Transform}
 import org.apache.spark.sql.types.StructType
 import xenon.clickhouse.expr.{Expr, FuncExpr, OrderExpr}
+import xenon.clickhouse.func.FunctionRegistry
 import xenon.clickhouse.spec._
 
 case class WriteJobDescription(
@@ -37,7 +37,8 @@ case class WriteJobDescription(
   shardingKey: Option[Expr],
   partitionKey: Option[List[Expr]],
   sortingKey: Option[List[OrderExpr]],
-  writeOptions: WriteOptions
+  writeOptions: WriteOptions,
+  functionRegistry: FunctionRegistry
 ) {
 
   def targetDatabase(convert2Local: Boolean): String = tableEngineSpec match {
@@ -56,20 +57,34 @@ case class WriteJobDescription(
   }
 
   def sparkShardExpr: Option[Expression] = shardingKeyIgnoreRand match {
-    case Some(expr) => ExprUtils.toSparkTransformOpt(expr)
+    case Some(expr) => ExprUtils.toSparkTransformOpt(expr, functionRegistry)
     case _ => None
   }
 
   def sparkSplits: Array[Transform] =
+    // Pmod by total weight * constant. Note that this key will be further hashed by spark. Reasons of doing this:
+    //   - Enlarged range of modulo to avoid hash collision of small number of shards, hence mitigate data skew caused
+    //     by this.
+    //   - Still distribute data from one shard to only a subset of executors. If we do not apply modulo (instead we
+    //     need to apply module during sorting in `toSparkSortOrders`), data belongs to shard 1 will be sorted in the
+    //     front for all tasks, resulting in instant high pressure for shard 1 when stage starts.
     if (writeOptions.repartitionByPartition) {
-      ExprUtils.toSparkSplits(shardingKeyIgnoreRand, partitionKey)
+      ExprUtils.toSparkSplits(
+        shardingKeyIgnoreRand.map(k => ExprUtils.toSplitWithModulo(k, cluster.get.totalWeight * 5)),
+        partitionKey,
+        functionRegistry
+      )
     } else {
-      ExprUtils.toSparkSplits(shardingKeyIgnoreRand, None)
+      ExprUtils.toSparkSplits(
+        shardingKeyIgnoreRand.map(k => ExprUtils.toSplitWithModulo(k, cluster.get.totalWeight * 5)),
+        None,
+        functionRegistry
+      )
     }
 
   def sparkSortOrders: Array[SortOrder] = {
     val _partitionKey = if (writeOptions.localSortByPartition) partitionKey else None
     val _sortingKey = if (writeOptions.localSortByKey) sortingKey else None
-    ExprUtils.toSparkSortOrders(shardingKeyIgnoreRand, _partitionKey, _sortingKey)
+    ExprUtils.toSparkSortOrders(shardingKeyIgnoreRand, _partitionKey, _sortingKey, cluster, functionRegistry)
   }
 }
